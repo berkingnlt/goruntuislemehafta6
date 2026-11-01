@@ -1,4 +1,5 @@
 ﻿#include <opencv2/opencv.hpp>
+#include <opencv2/imgproc.hpp>
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -8,305 +9,344 @@
 using namespace cv;
 using namespace std;
 
-struct Cember
+struct YaricapAdayi
 {
-    int x;
-    int y;
     int r;
     int oy;
 };
 
 int main()
 {
-    Mat resim = imread("images2.jpg", IMREAD_COLOR);
+    Mat orijinal = imread("images3.jpg", IMREAD_COLOR);
 
-    if (resim.empty())
+    if (orijinal.empty())
     {
-        cout << "images2.jpg bulunamadi!" << endl;
+        cout << "images3.jpg bulunamadi!" << endl;
         return -1;
     }
 
-    // 1. Kenarlari hazirla.
-    // Bu maddede Canny SONRASI median sarti yok.
-    // Paralarin ic desenlerini azaltmak icin griyi filtrele.
-    Mat gri, filtreli, kenarlar;
+    // 1. Gonderilen goruntunun altindaki yazi seridini
+    // disarida birak: sol ustten kare bolgeyi al.
+    int kareBoyutu = std::min(orijinal.cols, orijinal.rows);
 
+    Mat kare = orijinal(
+        Rect(0, 0, kareBoyutu, kareBoyutu)
+    ).clone();
+
+    // Hesaplama maliyetini azalt.
+    Mat resim;
+    resize(kare, resim, Size(400, 400), 0, 0, INTER_AREA);
+
+    double orijinaleOlcek = kareBoyutu / 400.0;
+
+    Mat gri, kenarlar;
     cvtColor(resim, gri, COLOR_BGR2GRAY);
-    GaussianBlur(gri, filtreli, Size(5, 5), 1.5);
-    Canny(filtreli, kenarlar, 80, 160);
+    Canny(gri, kenarlar, 50, 150);
 
-    int genislik = resim.cols;
-    int yukseklik = resim.rows;
+    // Kenara olan uzaklik:
+    // Kenar pikselinde 0, digerlerinde en yakin kenara mesafe.
+    Mat tersKenarlar, kenaraUzaklik;
+    bitwise_not(kenarlar, tersKenarlar);
 
-    // Gonderdigin 554x554 para goruntusu icin.
-    const int minR = 30;
-    const int maxR = 70;
-    const int yaricapSayisi = maxR - minR + 1;
+    cv::distanceTransform(
+        tersKenarlar,
+        kenaraUzaklik,
+        2,  // Öklid uzaklığı (DIST_L2)
+        0   // Hassas hesaplama (DIST_MASK_PRECISE)
+    );
 
-    // 2 derecelik adimla 180 farkli aci.
-    const int aciAdimi = 2;
+    // 2. Sin/cos tablolari.
+    const int aciAdimi = 4;
     const int aciSayisi = 360 / aciAdimi;
 
-    // 2. Sin/cos degerlerini bastan hesaplayip sakla.
     vector<double> sinTablosu(aciSayisi);
     vector<double> cosTablosu(aciSayisi);
 
     for (int t = 0; t < aciSayisi; t++)
     {
-        double radyan = t * aciAdimi * CV_PI / 180.0;
-
-        sinTablosu[t] = sin(radyan);
-        cosTablosu[t] = cos(radyan);
+        double aci = t * aciAdimi * CV_PI / 180.0;
+        sinTablosu[t] = sin(aci);
+        cosTablosu[t] = cos(aci);
     }
 
-    // 3. Uc boyutlu matris: A[rIndeksi][merkezY][merkezX].
-    // Bellekte tek vector icinde tutuluyor.
+    // 3. Merkez adaylarini 4 piksel aralikla tara.
+    // Herhangi bir merkez onceden verilmez.
+    const int merkezAdimi = 4;
+
+    int merkezXSayisi =
+        (resim.cols + merkezAdimi - 1) / merkezAdimi;
+
+    int merkezYSayisi =
+        (resim.rows + merkezAdimi - 1) / merkezAdimi;
+
+    const int minR = 12;
+    const int maxR = 190;
+    const int yaricapSayisi = maxR - minR + 1;
+
+    // A[rIndeksi][merkezYIndeksi][merkezXIndeksi]
     size_t hucreSayisi =
         static_cast<size_t>(yaricapSayisi) *
-        yukseklik * genislik;
+        merkezYSayisi * merkezXSayisi;
 
     vector<int> oylama(hucreSayisi, 0);
 
-    auto indeks = [=](int rIndeksi, int y, int x) -> size_t
+    auto indeks = [=](int ri, int yi, int xi) -> size_t
         {
             return
-                (static_cast<size_t>(rIndeksi) * yukseklik + y)
-                * genislik + x;
+                (static_cast<size_t>(ri) * merkezYSayisi + yi)
+                * merkezXSayisi + xi;
         };
 
-    cout << "3B matris: "
+    cout << "3B oylama matrisi: "
         << yaricapSayisi << " x "
-        << yukseklik << " x "
-        << genislik << endl;
+        << merkezYSayisi << " x "
+        << merkezXSayisi << endl;
 
-    cout << "Matris bellegi: "
-        << hucreSayisi * sizeof(int) / (1024.0 * 1024.0)
-        << " MB" << endl;
+    // Sayisallastirma ve kenarin iki tarafini tolere eder.
+    const float kenarToleransi = 1.5f;
 
-    vector<Point> kenarNoktalari;
-    findNonZero(kenarlar, kenarNoktalari);
+    // Bir cizginin ic/dis kenarini iki ayri halka sayma.
+    const int farkliHalkaAraligi = 12;
 
-    cout << "Kenar pikseli: "
-        << kenarNoktalari.size() << endl;
-
-    // 4. OYLAMA:
-    // x = a + r*cos(theta)
-    // y = b + r*sin(theta)
-    //
-    // Aday merkez:
-    // a = x - r*cos(theta)
-    // b = y - r*sin(theta)
-    for (int ri = 0; ri < yaricapSayisi; ri++)
-    {
-        int r = minR + ri;
-
-        for (size_t p = 0; p < kenarNoktalari.size(); p++)
+    // Sinir disindaki koordinatlar destek vermez.
+    auto kenarDestegi = [&](int x, int y) -> bool
         {
-            int x = kenarNoktalari[p].x;
-            int y = kenarNoktalari[p].y;
+            if (x < 0 || x >= resim.cols ||
+                y < 0 || y >= resim.rows)
+            {
+                return false;
+            }
+
+            return kenaraUzaklik.at<float>(y, x)
+                <= kenarToleransi;
+        };
+
+    // 4. ES MERKEZLILIGE OZEL OYLAMA.
+    //
+    // Her merkez ve aci icin:
+    // - Ayni yaricapin iki karsi ucunda kenar ara.
+    // - Bu kosulu saglayan farkli yaricaplari bul.
+    // - En az iki ayri halka destekliyorsa oy ver.
+    //
+    // Tek bir cemberin destegi tek basina oy uretemez.
+    vector<int> desteklenenYaricaplar;
+    desteklenenYaricaplar.reserve(yaricapSayisi);
+
+    for (int yi = 0; yi < merkezYSayisi; yi++)
+    {
+        int b = yi * merkezAdimi;
+
+        for (int xi = 0; xi < merkezXSayisi; xi++)
+        {
+            int a = xi * merkezAdimi;
 
             for (int t = 0; t < aciSayisi; t++)
             {
-                int a = cvRound(x - r * cosTablosu[t]);
-                int b = cvRound(y - r * sinTablosu[t]);
+                desteklenenYaricaplar.clear();
 
-                if (a < 0 || a >= genislik ||
-                    b < 0 || b >= yukseklik)
+                for (int ri = 0; ri < yaricapSayisi; ri++)
                 {
-                    continue;
-                }
+                    int r = minR + ri;
 
-                // A[r][b][a] bir oy alir.
-                int& hucre = oylama[indeks(ri, b, a)];
-                hucre++;
+                    int x1 = cvRound(a + r * cosTablosu[t]);
+                    int y1 = cvRound(b + r * sinTablosu[t]);
 
-                if (ri == 0 && p < 2 &&
-                    (t == 0 || t == 45))
-                {
-                    cout << "Kenar (" << x << "," << y << ")"
-                        << " r=" << r
-                        << " aci=" << t * aciAdimi
-                        << " -> merkez=(" << a << "," << b
-                        << ") oy=" << hucre << endl;
-                }
-            }
-        }
+                    int x2 = cvRound(a - r * cosTablosu[t]);
+                    int y2 = cvRound(b - r * sinTablosu[t]);
 
-        cout << "Oylama tamamlandi: r=" << r << endl;
-    }
-
-    // 5. Esigi gecen 3B yerel maksimumlari bul.
-    const int oyEsigi = 45;
-
-    vector<Cember> adaylar;
-
-    // Gorsellestirme icin her merkezdeki en yuksek
-    // yaricap oyunu al: P(y,x) = max_r A(r,y,x).
-    Mat merkezOylari = Mat::zeros(
-        yukseklik, genislik, CV_32SC1
-    );
-
-    for (int ri = 0; ri < yaricapSayisi; ri++)
-    {
-        for (int y = 0; y < yukseklik; y++)
-        {
-            for (int x = 0; x < genislik; x++)
-            {
-                int oy = oylama[indeks(ri, y, x)];
-
-                int& enYuksek = merkezOylari.at<int>(y, x);
-                enYuksek = std::max(enYuksek, oy);
-
-                if (oy < oyEsigi)
-                    continue;
-
-                bool maksimum = true;
-                size_t mevcutIndeks = indeks(ri, y, x);
-
-                for (int dr = -1; dr <= 1 && maksimum; dr++)
-                {
-                    int nr = ri + dr;
-
-                    if (nr < 0 || nr >= yaricapSayisi)
-                        continue;
-
-                    for (int dy = -1; dy <= 1 && maksimum; dy++)
+                    if (kenarDestegi(x1, y1) &&
+                        kenarDestegi(x2, y2))
                     {
-                        int ny = y + dy;
-
-                        if (ny < 0 || ny >= yukseklik)
-                            continue;
-
-                        for (int dx = -1; dx <= 1; dx++)
-                        {
-                            int nx = x + dx;
-
-                            if (nx < 0 || nx >= genislik)
-                                continue;
-
-                            size_t komsuIndeks = indeks(nr, ny, nx);
-                            int komsuOy = oylama[komsuIndeks];
-
-                            if (komsuOy > oy ||
-                                (komsuOy == oy &&
-                                    komsuIndeks < mevcutIndeks))
-                            {
-                                maksimum = false;
-                                break;
-                            }
-                        }
+                        desteklenenYaricaplar.push_back(ri);
                     }
                 }
 
-                if (maksimum)
-                    adaylar.push_back({ x, y, minR + ri, oy });
+                if (desteklenenYaricaplar.empty())
+                    continue;
+
+                // Liste yaricapa gore sirali.
+                int ilk = desteklenenYaricaplar.front();
+                int son = desteklenenYaricaplar.back();
+
+                for (int ri : desteklenenYaricaplar)
+                {
+                    bool baskaHalkaDestegi =
+                        ri - ilk >= farkliHalkaAraligi ||
+                        son - ri >= farkliHalkaAraligi;
+
+                    if (baskaHalkaDestegi)
+                    {
+                        // Ortak merkez + farkli yaricap destegi.
+                        // Her acida bu hucreye en fazla bir oy.
+                        oylama[indeks(ri, yi, xi)]++;
+                    }
+                }
             }
+        }
+
+        if (yi % 10 == 0)
+        {
+            cout << "Merkez satiri: "
+                << yi << "/" << merkezYSayisi << endl;
         }
     }
 
-    // 6. En yuksek oy alan adaylari once degerlendir.
-    sort(
-        adaylar.begin(),
-        adaylar.end(),
-        [](const Cember& a, const Cember& b)
-        {
-            return a.oy > b.oy;
-        }
+    // 5. ORTAK merkez ve ona ait yaricaplari sec.
+    // Ayri ayri bulunan cember merkezleri gruplanmaz.
+    const int oyEsigi = 45;
+    const int yaricapAyirma = 8;
+
+    int enIyiSkor = -1;
+    Point enIyiMerkez;
+    vector<YaricapAdayi> enIyiYaricaplar;
+
+    Mat merkezSkorlari = Mat::zeros(
+        merkezYSayisi, merkezXSayisi, CV_32SC1
     );
 
-    // Ayni paranin ic/dis kenarlarini tekrar secmeyi azalt.
-    // Bu madde ayri merkezli paralar icindir.
-    // Es merkezli cemberler icin bu secim kullanilmayacak.
-    const double minimumMerkezMesafesi = 70.0;
-
-    vector<Cember> bulunanlar;
-
-    for (const Cember& aday : adaylar)
+    for (int yi = 0; yi < merkezYSayisi; yi++)
     {
-        bool yakinMerkezVar = false;
-
-        for (const Cember& secilen : bulunanlar)
+        for (int xi = 0; xi < merkezXSayisi; xi++)
         {
-            double mesafe = hypot(
-                static_cast<double>(aday.x - secilen.x),
-                static_cast<double>(aday.y - secilen.y)
+            vector<YaricapAdayi> adaylar;
+
+            for (int ri = 0; ri < yaricapSayisi; ri++)
+            {
+                int oy = oylama[indeks(ri, yi, xi)];
+
+                if (oy >= oyEsigi)
+                    adaylar.push_back({ minR + ri, oy });
+            }
+
+            sort(
+                adaylar.begin(), adaylar.end(),
+                [](const YaricapAdayi& a, const YaricapAdayi& b)
+                {
+                    if (a.oy != b.oy)
+                        return a.oy > b.oy;
+
+                    return a.r < b.r;
+                }
             );
 
-            if (mesafe < minimumMerkezMesafesi)
+            // Ayni yaricap tepesinin yakin hucrelerini ele.
+            vector<YaricapAdayi> secilenler;
+
+            for (const auto& aday : adaylar)
             {
-                yakinMerkezVar = true;
-                break;
+                bool yakinYaricapVar = false;
+
+                for (const auto& secilen : secilenler)
+                {
+                    if (abs(aday.r - secilen.r) < yaricapAyirma)
+                    {
+                        yakinYaricapVar = true;
+                        break;
+                    }
+                }
+
+                if (!yakinYaricapVar)
+                    secilenler.push_back(aday);
+            }
+
+            if (secilenler.size() < 2)
+                continue;
+
+            int skor = 0;
+
+            for (const auto& secilen : secilenler)
+                skor += secilen.oy;
+
+            merkezSkorlari.at<int>(yi, xi) = skor;
+
+            if (skor > enIyiSkor)
+            {
+                enIyiSkor = skor;
+                enIyiMerkez = Point(
+                    xi * merkezAdimi,
+                    yi * merkezAdimi
+                );
+
+                enIyiYaricaplar = secilenler;
             }
         }
-
-        if (!yakinMerkezVar)
-            bulunanlar.push_back(aday);
     }
 
-    // 7. Cemberleri orijinal resme ciz.
-    Mat sonuc = resim.clone();
-    ofstream rapor("gorev4_cemberler.csv");
+    // 6. Orijinal boyuttaki goruntuye ciz.
+    Mat sonuc = orijinal.clone();
+
+    ofstream rapor("gorev5_cemberler.csv");
     rapor << "merkez_x,merkez_y,yaricap,oy\n";
 
-    for (size_t i = 0; i < bulunanlar.size(); i++)
+    if (enIyiSkor >= 0)
     {
-        const Cember& c = bulunanlar[i];
-        Point merkez(c.x, c.y);
-
-        circle(
-            sonuc, merkez, c.r,
-            Scalar(0, 0, 255), 2, LINE_AA
+        sort(
+            enIyiYaricaplar.begin(), enIyiYaricaplar.end(),
+            [](const YaricapAdayi& a, const YaricapAdayi& b)
+            {
+                return a.r < b.r;
+            }
         );
 
+        Point merkez(
+            cvRound(enIyiMerkez.x * orijinaleOlcek),
+            cvRound(enIyiMerkez.y * orijinaleOlcek)
+        );
+
+        cout << "\nOrtak merkez: " << merkez << endl;
+        cout << "Cember sayisi: "
+            << enIyiYaricaplar.size() << endl;
+
+        for (const auto& aday : enIyiYaricaplar)
+        {
+            int r = cvRound(aday.r * orijinaleOlcek);
+
+            circle(
+                sonuc, merkez, r,
+                Scalar(0, 0, 255), 3, LINE_AA
+            );
+
+            cout << "Yaricap: " << r
+                << " | Ortak destek oyu: "
+                << aday.oy << endl;
+
+            rapor << merkez.x << "," << merkez.y << ","
+                << r << "," << aday.oy << "\n";
+        }
+
         circle(
-            sonuc, merkez, 3,
+            sonuc, merkez, 5,
             Scalar(0, 255, 0), FILLED
         );
-
-        putText(
-            sonuc, to_string(i + 1),
-            Point(c.x + 5, c.y - 5),
-            FONT_HERSHEY_SIMPLEX, 0.6,
-            Scalar(255, 0, 0), 2
-        );
-
-        cout << "Cember " << i + 1
-            << ": merkez=(" << c.x << "," << c.y << ")"
-            << " r=" << c.r
-            << " oy=" << c.oy << endl;
-
-        rapor << c.x << "," << c.y << ","
-            << c.r << "," << c.oy << "\n";
+    }
+    else
+    {
+        cout << "Es merkezli cember grubu bulunamadi."
+            << endl;
     }
 
     rapor.close();
 
-    // 8. Oylama projeksiyonunu goruntu olarak kaydet.
-    Mat oylamaFloat, oylamaGoruntu;
-
-    merkezOylari.convertTo(oylamaFloat, CV_32F);
-    oylamaFloat += 1.0f;
-    cv::log(oylamaFloat, oylamaFloat);
+    // Ortak merkez skorlarini gorsellestir.
+    Mat skorGoruntu;
 
     normalize(
-        oylamaFloat, oylamaGoruntu,
+        merkezSkorlari, skorGoruntu,
         0, 255, NORM_MINMAX, CV_8U
     );
 
-    imwrite("gorev4_canny.png", kenarlar);
-    imwrite("gorev4_oylama_projeksiyonu.png", oylamaGoruntu);
-    imwrite("gorev4_manuel_cemberler.png", sonuc);
+    imwrite("gorev5_islenen_goruntu.png", resim);
+    imwrite("gorev5_canny.png", kenarlar);
+    imwrite("gorev5_ortak_merkez_oylari.png", skorGoruntu);
+    imwrite("gorev5_es_merkezli_cemberler.png", sonuc);
 
-    double maksimumOy;
-    minMaxLoc(merkezOylari, nullptr, &maksimumOy);
+    imshow("Canny - 400x400", kenarlar);
 
-    cout << "\nEn yuksek oy: " << maksimumOy << endl;
-    cout << "Oy esigi: " << oyEsigi << endl;
-    cout << "Bulunan cember: " << bulunanlar.size() << endl;
+    namedWindow("Ortak Merkez Oylari", WINDOW_NORMAL);
+    imshow("Ortak Merkez Oylari", skorGoruntu);
 
-    imshow("Canny", kenarlar);
-    imshow("Oylama - Yaricaplar Uzerinde Maksimum", oylamaGoruntu);
-    imshow("Manuel Hough Cemberler", sonuc);
+    namedWindow("Es Merkezli Cemberler", WINDOW_NORMAL);
+    imshow("Es Merkezli Cemberler", sonuc);
 
     waitKey(0);
     return 0;
